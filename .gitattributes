@@ -1,0 +1,19 @@
+# Pascal source files - keep CRLF on Windows
+*.pas text eol=crlf
+*.dpr text eol=crlf
+*.dpk text eol=crlf
+*.lpr text eol=crlf
+*.inc text eol=crlf
+*.dfm text eol=crlf
+
+# Project files
+*.dproj text eol=crlf
+*.lpi text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.txt text eol=lf
+
+# Config
+.gitignore text eol=lf
+.gitattributes text eol=lf

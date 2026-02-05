@@ -1,0 +1,43 @@
+# Delphi/Free Pascal compiled outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.dcu
+*.dcp
+*.bpl
+*.o
+*.ppu
+*.a
+*.res
+*.rsm
+*.map
+*.drc
+*.identcache
+*.local
+*.stat
+
+# Build directories
+Win32/
+Win64/
+bin/
+lib/
+__history/
+__recovery/
+
+# IDE files
+*.dsk
+*.~*
+*.bak
+
+# Lazarus specific
+*.compiled
+backup/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local configuration
+*.local.dproj
