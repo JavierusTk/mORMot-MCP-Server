@@ -1,10 +1,11 @@
 # Auto detect text files and perform LF normalization
-* text=auto
+* text=auto eol=lf
 
-# Delphi files - always CRLF (RAD Studio requirement)
+# Delphi / Lazarus source files - always CRLF (IDE requirement)
 *.pas   text eol=crlf
 *.dfm   text eol=crlf
 *.dpr   text eol=crlf
 *.dpk   text eol=crlf
 *.dproj text eol=crlf
-
+*.lpr   text eol=crlf
+*.lpi   text eol=crlf
