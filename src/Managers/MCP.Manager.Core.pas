@@ -194,6 +194,11 @@ begin
   TDocVariantData(ServerInfo).U['version'] := fSettings.ServerVersion;
   TDocVariantData(Result).AddValue('serverInfo', ServerInfo);
 
+  // Optional usage instructions (MCP 'instructions' field): emit only when the
+  // host app configured one, so the generic framework stays content-agnostic.
+  if fSettings.Instructions <> '' then
+    TDocVariantData(Result).U['instructions'] := fSettings.Instructions;
+
   TSynLog.Add.Log(sllInfo, 'Created new MCP session: %', [fSessionId]);
 end;
 

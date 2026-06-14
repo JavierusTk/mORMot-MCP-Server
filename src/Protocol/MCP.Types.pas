@@ -122,6 +122,10 @@ type
     CorsAllowedOrigins: RawUtf8;
     /// SSE keepalive interval in milliseconds (0 = disabled, default 30000)
     SSEKeepaliveIntervalMs: Cardinal;
+    /// Optional free-text usage hint returned to clients in the initialize
+    /// result (MCP 'instructions' field). Empty = omitted. Domain-specific
+    /// hosts set this to guide clients on how to use their tools effectively.
+    Instructions: RawUtf8;
   end;
 
 /// Initialize default MCP server settings
@@ -301,6 +305,7 @@ begin
   Settings.CorsEnabled := True;
   Settings.CorsAllowedOrigins := '*';
   Settings.SSEKeepaliveIntervalMs := 30000; // 30 seconds default
+  Settings.Instructions := ''; // omitted from initialize unless set by host app
 end;
 
 function CreateJsonRpcResponse(const RequestId: Variant): Variant;
