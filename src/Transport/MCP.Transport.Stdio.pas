@@ -52,6 +52,8 @@ type
     procedure OnToolsListChanged(const Data: Variant);
     procedure OnResourcesListChanged(const Data: Variant);
     procedure OnPromptsListChanged(const Data: Variant);
+    /// Generic passthrough: Data = {method, params}; forward verbatim
+    procedure OnSendNotification(const Data: Variant);
     /// Subscribe/unsubscribe to EventBus notifications
     procedure SubscribeToEventBus;
     procedure UnsubscribeFromEventBus;
@@ -284,6 +286,17 @@ begin
   SendNotification(MCP_EVENT_PROMPTS_LIST_CHANGED, Data);
 end;
 
+procedure TMCPStdioTransport.OnSendNotification(const Data: Variant);
+var
+  Doc: PDocVariantData;
+begin
+  // Generic passthrough: the publisher provides the actual JSON-RPC method
+  // and params; forward them verbatim. Used for server-initiated notifications
+  // the framework doesn't model directly (e.g. notifications/claude/channel).
+  Doc := _Safe(Data);
+  SendNotification(Doc^.U['method'], Doc^.GetValueOrNull('params'));
+end;
+
 procedure TMCPStdioTransport.SubscribeToEventBus;
 var
   EventBus: TMCPEventBus;
@@ -295,10 +308,14 @@ begin
   EventBus.ClearPending(MCP_EVENT_TOOLS_LIST_CHANGED);
   EventBus.ClearPending(MCP_EVENT_RESOURCES_LIST_CHANGED);
   EventBus.ClearPending(MCP_EVENT_PROMPTS_LIST_CHANGED);
+  // Drop any pre-subscription passthrough notifications (premature at startup)
+  EventBus.ClearPending(MCP_EVENT_SEND_NOTIFICATION);
   // Subscribe for future changes (app connect/disconnect)
   EventBus.Subscribe(MCP_EVENT_TOOLS_LIST_CHANGED, OnToolsListChanged);
   EventBus.Subscribe(MCP_EVENT_RESOURCES_LIST_CHANGED, OnResourcesListChanged);
   EventBus.Subscribe(MCP_EVENT_PROMPTS_LIST_CHANGED, OnPromptsListChanged);
+  // Generic server-initiated notification passthrough (e.g. channel events)
+  EventBus.Subscribe(MCP_EVENT_SEND_NOTIFICATION, OnSendNotification);
   TSynLog.Add.Log(sllInfo, 'Stdio transport subscribed to EventBus notifications');
 end;
 
@@ -310,6 +327,7 @@ begin
   EventBus.Unsubscribe(MCP_EVENT_TOOLS_LIST_CHANGED, OnToolsListChanged);
   EventBus.Unsubscribe(MCP_EVENT_RESOURCES_LIST_CHANGED, OnResourcesListChanged);
   EventBus.Unsubscribe(MCP_EVENT_PROMPTS_LIST_CHANGED, OnPromptsListChanged);
+  EventBus.Unsubscribe(MCP_EVENT_SEND_NOTIFICATION, OnSendNotification);
   TSynLog.Add.Log(sllInfo, 'Stdio transport unsubscribed from EventBus notifications');
 end;
 

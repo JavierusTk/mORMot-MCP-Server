@@ -28,6 +28,13 @@ const
   MCP_EVENT_PROGRESS = 'notifications/progress';
   MCP_EVENT_CANCELLED = 'notifications/cancelled';
 
+  /// Internal routing event (NOT an MCP method): generic server-initiated
+  /// notification passthrough. Publish with Data = {method, params}; a
+  /// subscribed transport forwards it verbatim to the client via
+  /// SendNotification(method, params). Lets host apps emit arbitrary
+  /// server->client notifications without the framework knowing the method.
+  MCP_EVENT_SEND_NOTIFICATION = '__internal/send_notification';
+
 type
   /// Callback type for event subscribers
   // Data parameter contains event-specific information as TDocVariant
