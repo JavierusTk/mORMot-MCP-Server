@@ -126,6 +126,11 @@ type
     /// result (MCP 'instructions' field). Empty = omitted. Domain-specific
     /// hosts set this to guide clients on how to use their tools effectively.
     Instructions: RawUtf8;
+    /// Optional JSON object merged into the initialize result's
+    /// capabilities.experimental field. Empty = omitted. Host apps set this
+    /// to advertise non-standard capabilities (e.g. '{"claude/channel":{}}')
+    /// without the generic framework having to know about them.
+    ExperimentalCapabilities: RawUtf8;
   end;
 
 /// Initialize default MCP server settings
@@ -306,6 +311,7 @@ begin
   Settings.CorsAllowedOrigins := '*';
   Settings.SSEKeepaliveIntervalMs := 30000; // 30 seconds default
   Settings.Instructions := ''; // omitted from initialize unless set by host app
+  Settings.ExperimentalCapabilities := ''; // omitted unless set by host app
 end;
 
 function CreateJsonRpcResponse(const RequestId: Variant): Variant;

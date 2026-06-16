@@ -124,6 +124,7 @@ var
   ParamsDoc, ClientInfo: PDocVariantData;
   ClientName, ClientVersion, NegotiatedVersion: RawUtf8;
   Capabilities, Tools, Resources, Prompts, ServerInfo: Variant;
+  Experimental: Variant;
 begin
   TSynLog.Add.Log(sllInfo, 'MCP Initialize called');
 
@@ -182,6 +183,17 @@ begin
 
   // Logging and Completions: omit from capabilities when not actively used.
   // MCP clients (Python SDK) use exclude_none=True, so absent = not supported.
+
+  // Experimental capabilities: host-provided JSON object merged verbatim, so
+  // the generic framework stays agnostic of any specific extension (e.g. the
+  // host can advertise '{"claude/channel":{}}' for Claude Code channels).
+  if fSettings.ExperimentalCapabilities <> '' then
+  begin
+    TDocVariantData(Experimental).InitJson(
+      fSettings.ExperimentalCapabilities, JSON_FAST_FLOAT);
+    if TDocVariantData(Experimental).Count > 0 then
+      TDocVariantData(Capabilities).AddValue('experimental', Experimental);
+  end;
 
   TDocVariantData(Result).AddValue('capabilities', Capabilities);
 
