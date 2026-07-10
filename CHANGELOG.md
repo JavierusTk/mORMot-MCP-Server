@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+- The stdio transport now decodes stdin as UTF-8 and writes `RawUtf8` bytes
+  directly to stdout. Previously the Windows console code page could corrupt
+  incoming Unicode and emit invalid JSONL bytes such as CP1252 `$97`.
+
 ### Added
 - **TLS/HTTPS support** for HTTP transport
   - `--tls` flag to enable TLS with certificate files

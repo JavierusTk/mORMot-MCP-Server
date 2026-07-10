@@ -73,11 +73,21 @@ type
 
 implementation
 
+{$ifdef OSWINDOWS}
+uses
+  Winapi.Windows;
+{$endif OSWINDOWS}
+
 { TMCPStdioTransport }
 
 constructor TMCPStdioTransport.Create(const AConfig: TMCPTransportConfig);
 begin
   inherited Create(AConfig);
+  {$ifdef OSWINDOWS}
+  // ReadLn otherwise decodes redirected stdin with the active ANSI page,
+  // turning valid JSON UTF-8 text such as "válido" into "vÃ¡lido".
+  SetTextCodePage(Input, CP_UTF8);
+  {$endif OSWINDOWS}
   InitializeCriticalSection(fWriteLock);
 end;
 
@@ -102,15 +112,24 @@ begin
 end;
 
 procedure TMCPStdioTransport.WriteLine(const Line: RawUtf8);
+var
+  Payload: RawUtf8;
+  Written: Integer;
 begin
   // Thread-safe: EventBus callbacks come from background threads (pipe monitor).
-  // Use Write + explicit LF instead of WriteLn. On Windows, WriteLn outputs
-  // CRLF (\r\n) but MCP clients expect LF-only (\n) line endings.
+  // Write RawUtf8 bytes directly. Converting through UnicodeString and the RTL
+  // Text output encoded non-ASCII characters with the Windows console code page
+  // (e.g. an em dash became a lone cp1252 $97 byte), violating JSONL UTF-8.
   EnterCriticalSection(fWriteLock);
   try
-    Write(Utf8ToString(Line));
-    Write(#10);
-    Flush(Output);
+    Payload := Line + #10; // MCP stdio uses LF-only newline-delimited JSON.
+    Written := FileWrite(
+      {$ifdef OSWINDOWS}GetStdHandle(STD_OUTPUT_HANDLE){$else}
+      TTextRec(Output).Handle{$endif}, Payload[1], Length(Payload));
+    if Written <> Length(Payload) then
+      raise EWriteError.CreateFmt(
+        'Unable to write MCP stdio response (%d of %d bytes)',
+        [Written, Length(Payload)]);
   finally
     LeaveCriticalSection(fWriteLock);
   end;
