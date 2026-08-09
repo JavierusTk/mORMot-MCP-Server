@@ -39,6 +39,9 @@ type
     /// Core methods
     function NegotiateProtocolVersion(const ClientVersion: RawUtf8): RawUtf8;
     function Initialize(const Params: Variant): Variant;
+    /// server/discover (2026-07-28): advertise supported versions and
+    // capabilities without any handshake - servers MUST implement it
+    function Discover: Variant;
     function Ping: Variant;
     /// Handle cancellation notification
     procedure HandleCancellation(const Params: Variant);
@@ -78,6 +81,7 @@ end;
 function TMCPCoreManager.HandlesMethod(const Method: RawUtf8): Boolean;
 begin
   Result := IdemPropNameU(Method, 'initialize') or
+            IdemPropNameU(Method, 'server/discover') or
             IdemPropNameU(Method, 'notifications/initialized') or
             IdemPropNameU(Method, 'notifications/cancelled') or
             IdemPropNameU(Method, 'ping');
@@ -88,6 +92,8 @@ function TMCPCoreManager.ExecuteMethod(const Method: RawUtf8;
 begin
   if IdemPropNameU(Method, 'initialize') then
     Result := Initialize(Params)
+  else if IdemPropNameU(Method, 'server/discover') then
+    Result := Discover
   else if IdemPropNameU(Method, 'notifications/initialized') then
   begin
     TSynLog.Add.Log(sllInfo, 'MCP Initialized notification received');
@@ -212,6 +218,56 @@ begin
     TDocVariantData(Result).U['instructions'] := fSettings.Instructions;
 
   TSynLog.Add.Log(sllInfo, 'Created new MCP session: %', [fSessionId]);
+end;
+
+function TMCPCoreManager.Discover: Variant;
+var
+  Capabilities, Tools, Resources, Prompts, Completions: Variant;
+  Experimental: Variant;
+begin
+  TSynLog.Add.Log(sllInfo, 'MCP server/discover called');
+
+  TDocVariantData(Result).InitFast;
+  TDocVariantData(Result).AddValue('supportedVersions',
+    SupportedProtocolVersionsArray);
+
+  // capabilities follow the 2026-07-28 ServerCapabilities schema shape
+  // (no legacy extras like supportsProgress); resources.subscribe means
+  // resourceSubscriptions are honored on subscriptions/listen streams
+  TDocVariantData(Capabilities).InitFast;
+
+  TDocVariantData(Tools).InitFast;
+  TDocVariantData(Tools).B['listChanged'] := True;
+  TDocVariantData(Capabilities).AddValue('tools', Tools);
+
+  TDocVariantData(Resources).InitFast;
+  TDocVariantData(Resources).B['subscribe'] := True;
+  TDocVariantData(Resources).B['listChanged'] := True;
+  TDocVariantData(Capabilities).AddValue('resources', Resources);
+
+  TDocVariantData(Prompts).InitFast;
+  TDocVariantData(Prompts).B['listChanged'] := True;
+  TDocVariantData(Capabilities).AddValue('prompts', Prompts);
+
+  Completions := _ObjFast([]); // empty OBJECT (InitFast alone yields null)
+  TDocVariantData(Capabilities).AddValue('completions', Completions);
+
+  // logging capability is deliberately absent: the feature is deprecated in
+  // 2026-07-28 and this server does not emit notifications/message for
+  // modern-era requests
+
+  if fSettings.ExperimentalCapabilities <> '' then
+  begin
+    TDocVariantData(Experimental).InitJson(
+      fSettings.ExperimentalCapabilities, JSON_FAST_FLOAT);
+    if TDocVariantData(Experimental).Count > 0 then
+      TDocVariantData(Capabilities).AddValue('experimental', Experimental);
+  end;
+
+  TDocVariantData(Result).AddValue('capabilities', Capabilities);
+
+  if fSettings.Instructions <> '' then
+    TDocVariantData(Result).U['instructions'] := fSettings.Instructions;
 end;
 
 function TMCPCoreManager.Ping: Variant;

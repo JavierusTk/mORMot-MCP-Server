@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-mORMot2 MCP Server: a high-performance Model Context Protocol (MCP) server implementing the **2025-06-18 specification**, built on the [mORMot2](https://github.com/synopse/mORMot2) framework. Pure Pascal, no external dependencies beyond mORMot2. Dual-compiler: Delphi 10.3+ and Free Pascal 3.2+.
+mORMot2 MCP Server: a high-performance Model Context Protocol (MCP) server implementing the **2026-07-28 specification** (stateless per-request model) with full backward compatibility down to **2024-11-05** (initialize/session model), built on the [mORMot2](https://github.com/synopse/mORMot2) framework. Pure Pascal, no external dependencies beyond mORMot2. Dual-compiler: Delphi 10.3+ and Free Pascal 3.2+.
+
+**Dual-era model**: each request's protocol era is resolved from `_meta['io.modelcontextprotocol/protocolVersion']` (authoritative) and/or the `MCP-Protocol-Version` HTTP header. Versions >= 2026-07-28 follow the *modern* stateless path (no initialize, no sessions, `resultType` + `serverInfo` + cache hints on results, `server/discover`, `subscriptions/listen`); older versions follow the *legacy* path unchanged (initialize handshake, `Mcp-Session-Id`, GET SSE stream, `ping`, `logging/setLevel`, `resources/subscribe`). The era logic lives in `src/Core/MCP.RequestProcessor.pas`.
 
 ## Building
 
@@ -36,11 +38,14 @@ MCPServer.exe --transport=http --daemon   # Daemon mode (Ctrl+C to stop)
 ```
 Client (JSON-RPC 2.0)
   → Transport (stdio or HTTP+SSE)
-    → TMCPRequestProcessor.HandleRequest()
+    → TMCPRequestProcessor.HandleRequestEx()   [era resolution + validation]
       → TMCPManagerRegistry.GetManagerForMethod()
         → IMCPCapabilityManager.ExecuteMethod()
-          → Response (JSON-RPC 2.0)
+          → modern-era decoration (resultType, _meta.serverInfo, ttlMs/cacheScope)
+            → Response (JSON-RPC 2.0)
 ```
+
+`subscriptions/listen` is intercepted at the transport layer (it owns the long-lived stream registry) and never reaches the processor.
 
 ### Layer Responsibilities
 
@@ -48,11 +53,11 @@ Client (JSON-RPC 2.0)
 |-------|----------|---------|
 | **Protocol** | `src/Protocol/MCP.Types.pas` | Core types, settings record, JSON-RPC helpers, error codes, cancelled request tracking |
 | **Transport** | `src/Transport/` | Pluggable I/O: `TMCPStdioTransport` (stdin/stdout) and `TMCPHttpTransport` (async HTTP + SSE via `THttpAsyncServer`) |
-| **Core** | `src/Core/` | `TMCPManagerRegistry` (method→manager dispatch) and `TMCPEventBus` (thread-safe pub/sub singleton) |
+| **Core** | `src/Core/` | `TMCPManagerRegistry` (method→manager dispatch), `TMCPRequestProcessor` (shared JSON-RPC dispatch + protocol-era logic for both `.dpr`/`.lpr`) and `TMCPEventBus` (thread-safe pub/sub singleton) |
 | **Managers** | `src/Managers/` | One per MCP capability namespace: Core, Tools, Resources, Prompts, Logging, Completion |
 | **Extensions** | `src/Tools/`, `src/Resources/`, `src/Prompts/` | Base classes + example implementations for each extensible capability |
 | **Server** | `src/Server/MCP.Server.pas` | Legacy HTTP server (superseded by transport layer) |
-| **Entry** | `MCPServer.dpr` / `.lpr` | Wiring: creates registry, managers, tools, transport; contains `TMCPRequestProcessor` |
+| **Entry** | `MCPServer.dpr` / `.lpr` | Wiring: creates registry, managers, tools, transport; wires `TMCPRequestProcessor.HandleRequestEx` |
 
 ### Key Design Patterns
 
@@ -87,13 +92,16 @@ The codebase uses `RawUtf8` (mORMot2's UTF-8 string type) everywhere, not `strin
 
 ### MCP Protocol Constants
 
-- Protocol version: `MCP_PROTOCOL_VERSION = '2025-06-18'` (also supports `'2025-03-26'`)
-- JSON-RPC errors: `JSONRPC_PARSE_ERROR` (-32700), `JSONRPC_METHOD_NOT_FOUND` (-32601), `JSONRPC_REQUEST_CANCELLED` (-32800), `JSONRPC_RESOURCE_NOT_FOUND` (-32002)
+- Protocol version: `MCP_PROTOCOL_VERSION = '2026-07-28'`; supported: `2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05` (`MCP_SUPPORTED_VERSIONS`); modern-era threshold: `MCP_PROTOCOL_VERSION_MODERN`
+- JSON-RPC errors: `JSONRPC_PARSE_ERROR` (-32700), `JSONRPC_METHOD_NOT_FOUND` (-32601), `JSONRPC_REQUEST_CANCELLED` (-32800), `JSONRPC_RESOURCE_NOT_FOUND` (-32002, legacy eras only; modern uses -32602), `JSONRPC_HEADER_MISMATCH` (-32020), `JSONRPC_MISSING_CLIENT_CAPABILITY` (-32021), `JSONRPC_UNSUPPORTED_PROTOCOL_VERSION` (-32022)
+- Reserved `_meta` keys: `MCP_META_PROTOCOL_VERSION`, `MCP_META_CLIENT_INFO`, `MCP_META_CLIENT_CAPABILITIES`, `MCP_META_LOG_LEVEL`, `MCP_META_SERVER_INFO`, `MCP_META_SUBSCRIPTION_ID` (all `io.modelcontextprotocol/...`)
 
 ### HTTP Transport Details
 
-- Endpoint: `GET /mcp` (SSE stream), `POST /mcp` (JSON-RPC requests), `DELETE /mcp` (session termination)
-- 128-bit cryptographic session IDs (via `TAesPrng`)
+- Endpoint: `POST /mcp` (JSON-RPC requests; the only method in 2026-07-28). Legacy eras also get `GET /mcp` (SSE stream) and `DELETE /mcp` (session termination); a modern `MCP-Protocol-Version` header on GET/DELETE returns 405
+- Modern POST validation (SEP-2243): `MCP-Protocol-Version` + `Mcp-Method` required on every request; `Mcp-Name` required for `tools/call`/`prompts/get` (`params.name`) and `resources/read` (`params.uri`), supporting the `=?base64?...?=` sentinel encoding; mismatch → 400 + `-32020`
+- `subscriptions/listen` POST answers with a long-lived SSE stream: first event is `notifications/subscriptions/acknowledged` (with `subscriptionId` in `_meta`), then only opted-in notifications; graceful shutdown sends the final JSON-RPC response on the stream
+- 128-bit cryptographic session IDs (via `TAesPrng`) — legacy eras only
 - SSE keepalive comments every 30s (configurable)
 - CORS enabled by default (all origins)
 
