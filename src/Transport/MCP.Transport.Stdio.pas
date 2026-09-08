@@ -1,4 +1,4 @@
-﻿/// MCP Stdio Transport Implementation
+/// MCP Stdio Transport Implementation
 // - Standard input/output transport for CLI-based MCP communication
 // - Used by Claude Desktop and other MCP clients that spawn the server
 // - Reads JSON-RPC from stdin (newline delimited)
@@ -50,6 +50,7 @@ type
   // - Handles SIGTERM/SIGINT with graceful shutdown (5s timeout for pending requests)
   TMCPStdioTransport = class(TMCPTransportBase)
   private
+    fTracePayloads: Boolean;
     fWriteLock: TRTLCriticalSection;
     fSubsLock: TRTLCriticalSection;
     fSubscriptions: array of TMCPStdioSubscription;
@@ -92,6 +93,8 @@ type
     procedure SubscribeToEventBus;
     procedure UnsubscribeFromEventBus;
   public
+    /// Explicit diagnostic opt-in; full payloads can contain private arguments.
+    property TracePayloads: Boolean read fTracePayloads write fTracePayloads;
     /// Create stdio transport
     constructor Create(const AConfig: TMCPTransportConfig); override;
     /// Destroy the transport
@@ -218,7 +221,7 @@ begin
         Continue;
       end;
 
-      LogToStderr(FormatUtf8('Received: %', [InputLine]));
+      if fTracePayloads then LogToStderr(FormatUtf8('Received: %', [InputLine]));
 
       // Peek at the method for transport-level handling
       Method := '';
@@ -259,7 +262,7 @@ begin
       if ResponseJson <> '' then
       begin
         WriteLine(ResponseJson);
-        LogToStderr(FormatUtf8('Sent: %', [ResponseJson]));
+        if fTracePayloads then LogToStderr(FormatUtf8('Sent: %', [ResponseJson]));
       end;
     except
       on E: Exception do
