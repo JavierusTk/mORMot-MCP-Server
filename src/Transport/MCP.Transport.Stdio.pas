@@ -1,4 +1,4 @@
-/// MCP Stdio Transport Implementation
+﻿/// MCP Stdio Transport Implementation
 // - Standard input/output transport for CLI-based MCP communication
 // - Used by Claude Desktop and other MCP clients that spawn the server
 // - Reads JSON-RPC from stdin (newline delimited)
