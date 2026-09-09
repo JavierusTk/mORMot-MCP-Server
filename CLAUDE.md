@@ -113,3 +113,26 @@ The codebase uses `RawUtf8` (mORMot2's UTF-8 string type) everywhere, not `strin
 4. Registry → CoreManager → LoggingManager → ToolsManager → ResourcesManager → PromptsManager → CompletionManager
 5. Register built-in tools (Echo, GetTime)
 6. Create transport → `RunWithTransport()` (blocks)
+
+## Deferred: OAuth Authorization for the HTTP Transport
+
+Decision (2026-08-21): **deferred until the HTTP transport is actually exposed publicly**. While usage is stdio or trusted LAN there is no gap — the MCP spec makes authorization OPTIONAL, and for stdio it explicitly says NOT to use OAuth (credentials come from the environment).
+
+**Spec status**: OAuth authorization is an official part of the MCP spec for HTTP transports (since 2025-03-26; consolidated 2025-06-18; refined 2025-11-25). A *protected* server must implement the OAuth 2.1 **resource server** role only:
+
+- `401` + `WWW-Authenticate` header pointing at the resource metadata (header optional since 2025-11-25 / SEP-985, with fallback to the well-known URL)
+- Serve `GET /.well-known/oauth-protected-resource` (RFC 9728) listing `authorization_servers`
+- Validate tokens **including audience** (RFC 8707 — reject tokens issued for another resource); `403` for insufficient scopes, `400` for malformed
+- The authorization server itself is OUT of the MCP spec's scope
+
+**Current state**: zero auth. `src/Transport/MCP.Transport.Http.pas` never reads the `Authorization` header; no 401 path, no well-known route, no bearer settings; CORS open. `SPEC-tls-support.md` explicitly excludes client-cert auth.
+
+**Agreed design for when it's implemented**:
+
+1. Resource-server role ONLY. Do not build an authorization server — point to an **external IdP** (Keycloak, Entra ID, Auth0, ...) configurable by URL.
+2. Token validation in two modes: **local JWT** via `mormot.crypt.jwt` (already in the mORMot2 dependency; RFC 9068: JWKS signature + `aud` + `exp` + `scope`) as default, plus an `OnValidateAccessToken` callback so the host decides (RFC 7662 introspection fits there when the IdP doesn't issue JWTs).
+3. Settings: `RequireBearerAuth`, issuer list, canonical audience URI, required scopes.
+4. Fits the modern 2026-07-28 stateless era naturally: Bearer on every POST, no sessions.
+5. **Order: TLS first, OAuth second** — the spec requires HTTPS on all endpoints. Sequence: finish `SPEC-tls-support.md`, then a new `SPEC-oauth-resource-server.md`.
+
+Estimated effort (resource-server side): 1-2 days including tests. Note: a static bearer API key scheme (`Authorization: Bearer key:secret`) only shares the header syntax with this — it is not OAuth (no issuer, no expiry/scopes/audience, no discovery) and does not satisfy the MCP authorization spec.
