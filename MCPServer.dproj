@@ -86,6 +86,7 @@
         <DCCReference Include="src\Protocol\MCP.Types.pas"/>
         <DCCReference Include="src\Server\MCP.Server.pas"/>
         <DCCReference Include="src\Core\MCP.Manager.Registry.pas"/>
+        <DCCReference Include="src\Core\MCP.RequestProcessor.pas"/>
         <DCCReference Include="src\Managers\MCP.Manager.Core.pas"/>
         <DCCReference Include="src\Managers\MCP.Manager.Tools.pas"/>
         <DCCReference Include="src\Tools\MCP.Tool.Base.pas"/>

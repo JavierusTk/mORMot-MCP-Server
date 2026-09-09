@@ -58,6 +58,12 @@ type
   TMCPRequestHandler = function(const RequestJson: RawUtf8;
     const SessionId: RawUtf8): RawUtf8 of object;
 
+  /// Era-aware callback type for processing incoming JSON-RPC requests
+  // - The transport fills the Context inputs (HTTP headers, session) and
+  //   reads back the resolved protocol version / suggested HTTP status
+  TMCPRequestHandlerEx = function(const RequestJson: RawUtf8;
+    var Context: TMCPRequestContext): RawUtf8 of object;
+
   /// Transport interface for MCP communication
   // Implementations handle the specifics of stdio, HTTP, etc.
   IMCPTransport = interface
@@ -97,6 +103,7 @@ type
     fShuttingDown: Boolean;
     fConfig: TMCPTransportConfig;
     fRequestHandler: TMCPRequestHandler;
+    fRequestHandlerEx: TMCPRequestHandlerEx;
     fManagerRegistry: IMCPManagerRegistry;
     fSessionId: RawUtf8;
     fPendingRequests: Integer;
@@ -106,6 +113,10 @@ type
     // - Automatically tracks pending request count for graceful shutdown
     function ProcessRequest(const RequestJson: RawUtf8;
       const SessionId: RawUtf8): RawUtf8;
+    /// Era-aware processing - prefers the Ex handler, falls back to legacy
+    // - Automatically tracks pending request count for graceful shutdown
+    function ProcessRequestEx(const RequestJson: RawUtf8;
+      var Ctx: TMCPRequestContext): RawUtf8;
     /// Build a JSON-RPC notification message
     function BuildNotification(const Method: RawUtf8;
       const Params: Variant): RawUtf8;
@@ -129,6 +140,8 @@ type
     function IsActive: Boolean; virtual;
     function IsShuttingDown: Boolean; virtual;
     procedure SetRequestHandler(const Handler: TMCPRequestHandler); virtual;
+    /// Wire the era-aware handler (preferred - enables 2026-07-28 handling)
+    procedure SetRequestHandlerEx(const Handler: TMCPRequestHandlerEx); virtual;
     function GetTransportType: TMCPTransportType; virtual;
     function GetPendingRequestCount: Integer; virtual;
     /// Manager registry for handling MCP methods
@@ -335,12 +348,24 @@ end;
 
 function TMCPTransportBase.ProcessRequest(const RequestJson: RawUtf8;
   const SessionId: RawUtf8): RawUtf8;
+var
+  Ctx: TMCPRequestContext;
+begin
+  InitRequestContext(Ctx);
+  Ctx.SessionId := SessionId;
+  Result := ProcessRequestEx(RequestJson, Ctx);
+end;
+
+function TMCPTransportBase.ProcessRequestEx(const RequestJson: RawUtf8;
+  var Ctx: TMCPRequestContext): RawUtf8;
 begin
   // Track pending request for graceful shutdown
   BeginRequest;
   try
-    if Assigned(fRequestHandler) then
-      Result := fRequestHandler(RequestJson, SessionId)
+    if Assigned(fRequestHandlerEx) then
+      Result := fRequestHandlerEx(RequestJson, Ctx)
+    else if Assigned(fRequestHandler) then
+      Result := fRequestHandler(RequestJson, Ctx.SessionId)
     else
       Result := CreateJsonRpcError(Null, JSONRPC_INTERNAL_ERROR,
         'No request handler configured');
@@ -371,6 +396,12 @@ procedure TMCPTransportBase.SetRequestHandler(
   const Handler: TMCPRequestHandler);
 begin
   fRequestHandler := Handler;
+end;
+
+procedure TMCPTransportBase.SetRequestHandlerEx(
+  const Handler: TMCPRequestHandlerEx);
+begin
+  fRequestHandlerEx := Handler;
 end;
 
 function TMCPTransportBase.GetTransportType: TMCPTransportType;

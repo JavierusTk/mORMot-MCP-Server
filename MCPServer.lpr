@@ -20,6 +20,7 @@ uses
   MCP.Types,
   MCP.Server,
   MCP.Manager.Registry,
+  MCP.RequestProcessor,
   MCP.Events,
   MCP.Manager.Core,
   MCP.Manager.Logging,
@@ -36,18 +37,6 @@ uses
   MCP.Transport.Http,
   MCP.Transport.Stdio;
 
-type
-  /// Helper class to provide request handler method
-  TMCPRequestProcessor = class
-  private
-    fRegistry: IMCPManagerRegistry;
-  public
-    constructor Create(ARegistry: IMCPManagerRegistry);
-    function HandleRequest(const RequestJson: RawUtf8;
-      const SessionId: RawUtf8): RawUtf8;
-    property Registry: IMCPManagerRegistry read fRegistry;
-  end;
-
 var
   Settings: TMCPServerSettings;
   Server: TMCPHttpServer;
@@ -63,72 +52,6 @@ var
   UseNewTransport: Boolean;
   TransportConfig: TMCPTransportConfig;
   RequestProcessor: TMCPRequestProcessor;
-
-{ TMCPRequestProcessor }
-
-constructor TMCPRequestProcessor.Create(ARegistry: IMCPManagerRegistry);
-begin
-  inherited Create;
-  fRegistry := ARegistry;
-end;
-
-function TMCPRequestProcessor.HandleRequest(const RequestJson: RawUtf8;
-  const SessionId: RawUtf8): RawUtf8;
-var
-  Request, Response: Variant;
-  RequestId: Variant;
-  Method: RawUtf8;
-  Params: Variant;
-  Manager: IMCPCapabilityManager;
-  MethodResult: Variant;
-begin
-  Result := '';
-
-  try
-    TDocVariantData(Request).InitJson(RequestJson, JSON_FAST_FLOAT);
-    RequestId := TDocVariantData(Request).Value['id'];
-    Method := TDocVariantData(Request).U['method'];
-
-    // Handle notifications (no response needed)
-    if Method = 'notifications/initialized' then
-    begin
-      TSynLog.Add.Log(sllInfo, 'MCP Initialized notification received');
-      Exit;
-    end;
-
-    if fRegistry = nil then
-    begin
-      Result := CreateJsonRpcError(RequestId, JSONRPC_INTERNAL_ERROR,
-        'Manager registry not initialized');
-      Exit;
-    end;
-
-    Manager := fRegistry.GetManagerForMethod(Method);
-    if Manager = nil then
-    begin
-      Result := CreateJsonRpcError(RequestId, JSONRPC_METHOD_NOT_FOUND,
-        FormatUtf8('Method [%] not found', [Method]));
-      Exit;
-    end;
-
-    Params := TDocVariantData(Request).Value['params'];
-    MethodResult := Manager.ExecuteMethod(Method, Params);
-
-    Response := CreateJsonRpcResponse(RequestId);
-    if not VarIsEmptyOrNull(MethodResult) then
-      TDocVariantData(Response).AddValue('result', MethodResult);
-
-    Result := TDocVariantData(Response).ToJson;
-
-  except
-    on E: Exception do
-    begin
-      TSynLog.Add.Log(sllError, 'Error processing request: %', [E.Message]);
-      Result := CreateJsonRpcError(RequestId, JSONRPC_INTERNAL_ERROR,
-        StringToUtf8(E.Message));
-    end;
-  end;
-end;
 
 procedure InitializeLogging;
 begin
@@ -212,6 +135,11 @@ begin
     Inc(I);
   end;
 
+  // --port=N form (the one documented in the README)
+  S := GetSwitchValue('port');
+  if S <> '' then
+    Settings.Port := StrToIntDef(S, Settings.Port);
+
   // Parse transport type
   TransportTypeStr := StringToUtf8(GetSwitchValue('transport'));
   if TransportTypeStr = '' then
@@ -242,7 +170,7 @@ begin
         StdioTransport := TMCPStdioTransport.Create(TransportConfig);
         try
           StdioTransport.ManagerRegistry := Registry;
-          StdioTransport.SetRequestHandler(RequestProcessor.HandleRequest);
+          StdioTransport.SetRequestHandlerEx(RequestProcessor.HandleRequestEx);
           StdioTransport.Start; // Blocks until EOF or SIGTERM/SIGINT
         finally
           StdioTransport.Free;
@@ -262,7 +190,7 @@ begin
         HttpTransport := TMCPHttpTransport.Create(TransportConfig);
         try
           HttpTransport.ManagerRegistry := Registry;
-          HttpTransport.SetRequestHandler(RequestProcessor.HandleRequest);
+          HttpTransport.SetRequestHandlerEx(RequestProcessor.HandleRequestEx);
           HttpTransport.Start;
 
           WriteLn;
@@ -391,7 +319,7 @@ begin
   Registry.RegisterManager(CompletionManager);
 
   // Create request processor
-  RequestProcessor := TMCPRequestProcessor.Create(Registry);
+  RequestProcessor := TMCPRequestProcessor.Create(Registry, Settings);
   try
     // Run with appropriate transport
     if UseNewTransport or (TransportType = mttStdio) then

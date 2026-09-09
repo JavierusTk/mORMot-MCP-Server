@@ -4,7 +4,7 @@
 
 Implementación de alto rendimiento del [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) usando el framework [mORMot2](https://github.com/synopse/mORMot2).
 
-**Implementa la especificación MCP 2025-06-18** con soporte completo para notificaciones bidireccionales vía SSE.
+**Implementa la especificación MCP 2026-07-28** (modelo sin estado por petición, `server/discover`, `subscriptions/listen`) con compatibilidad completa hacia atrás con clientes basados en initialize (2024-11-05 a 2025-11-25) y notificaciones bidireccionales vía SSE.
 
 ## Características
 
@@ -137,6 +137,29 @@ curl -N -H "Accept: text/event-stream" http://localhost:3000/mcp
 
 ## Ejemplos de API
 
+### Petición sin estado (2026-07-28, sin handshake)
+
+```bash
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+      }
+    }
+  }'
+```
+
+Usa `server/discover` (misma forma, `Mcp-Method: server/discover`) para
+obtener por adelantado las versiones soportadas y las capabilities.
+
 ### Inicializar Sesión
 
 ```bash
@@ -268,4 +291,4 @@ Licencia MIT - Ver archivo [LICENSE](LICENSE).
 
 - [Documentación mORMot2](https://synopse.info/files/doc/mORMot2.html)
 - [Especificación MCP](https://spec.modelcontextprotocol.io/)
-- [MCP Protocol Version 2025-06-18](https://modelcontextprotocol.io/docs/concepts/transports)
+- [MCP Protocol Version 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28)

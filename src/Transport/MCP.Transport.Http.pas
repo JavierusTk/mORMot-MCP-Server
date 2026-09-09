@@ -54,10 +54,12 @@ const
 
 type
   /// Record to track an SSE client connection
+  // - covers both legacy GET streams (2025-xx eras) and 2026-07-28
+  //   subscriptions/listen response streams
   TMCPSSEConnection = record
     /// Async handle for the connection
     Handle: TConnectionAsyncHandle;
-    /// Session ID associated with this connection
+    /// Session ID associated with this connection (legacy GET streams)
     SessionId: RawUtf8;
     /// Timestamp when connection was established
     ConnectedAt: TDateTime;
@@ -65,6 +67,16 @@ type
     LastSentAt: Int64;
     /// Whether this connection is active
     Active: Boolean;
+    /// True when this is a 2026-07-28 subscriptions/listen stream
+    IsSubscription: Boolean;
+    /// JSON-RPC id of the subscriptions/listen request (= subscription id)
+    SubscriptionId: Variant;
+    /// agreed notification filter (subscriptions/listen only)
+    FilterTools: Boolean;
+    FilterPrompts: Boolean;
+    FilterResources: Boolean;
+    /// resource URIs subscribed via resourceSubscriptions
+    FilterUris: TRawUtf8DynArray;
   end;
 
   /// Dynamic array of SSE connections
@@ -138,11 +150,29 @@ type
       const HeaderName: RawUtf8): RawUtf8;
     /// Check if client accepts SSE
     function AcceptsSSE(Ctxt: THttpServerRequestAbstract): Boolean;
-    /// Add an SSE connection to tracking
+    /// Add a connection record to tracking (shared slot logic)
+    function AddSSEConnectionSlot(const Conn: TMCPSSEConnection): Boolean;
+    /// Add a legacy GET SSE connection to tracking
     function AddSSEConnection(Handle: TConnectionAsyncHandle;
       const SessionId: RawUtf8): Boolean;
+    /// Add a 2026-07-28 subscriptions/listen stream to tracking
+    function AddSubscriptionConnection(Handle: TConnectionAsyncHandle;
+      const SubscriptionId: Variant;
+      AFilterTools, AFilterPrompts, AFilterResources: Boolean;
+      const AFilterUris: TRawUtf8DynArray): Boolean;
     /// Remove an SSE connection from tracking
     procedure RemoveSSEConnection(Handle: TConnectionAsyncHandle);
+    /// Handle a modern-era POST subscriptions/listen request
+    function HandleSubscriptionsListen(Ctxt: THttpServerRequestAbstract;
+      const RequestDoc: Variant): Cardinal;
+    /// Route a server-to-client notification to the right streams
+    // - legacy GET streams receive every notification (pre-2026 behavior)
+    // - subscriptions/listen streams only receive the notification types the
+    //   client opted in to, tagged with their subscription id in _meta
+    procedure BroadcastEvent(const Method: RawUtf8; const Params: Variant);
+    /// Send the final SubscriptionsListenResult to every open subscription
+    // stream (graceful teardown, 2026-07-28)
+    procedure SendSubscriptionTeardowns;
     /// Format a message as SSE data
     function FormatSSEData(const JsonData: RawUtf8): RawUtf8;
     /// Send SSE data to a specific connection
@@ -229,7 +259,9 @@ uses
 
 const
   HTTP_OK = 200;
+  HTTP_ACCEPTED_202 = 202;
   HTTP_NO_CONTENT = 204;
+  HTTP_BAD_REQUEST = 400;
   HTTP_FORBIDDEN = 403;
   HTTP_NOT_FOUND = 404;
   HTTP_METHOD_NOT_ALLOWED = 405;
@@ -404,13 +436,21 @@ begin
   if TimeoutMs = 0 then
     TimeoutMs := GRACEFUL_SHUTDOWN_TIMEOUT_MS;
 
-  // Send shutdown notification to all SSE clients
+  // Send shutdown notification to legacy SSE clients (non-spec, historical)
   TDocVariantData(NotifyParams).InitFast;
   TDocVariantData(NotifyParams).S['reason'] := 'server_shutdown';
   try
     SendNotification('notifications/shutdown', NotifyParams);
   except
     // Ignore errors during shutdown notification
+  end;
+
+  // 2026-07-28: a subscriptions/listen stream torn down gracefully receives
+  // its JSON-RPC response (SubscriptionsListenResult) as the final message
+  try
+    SendSubscriptionTeardowns;
+  except
+    // Ignore errors during shutdown teardown
   end;
 
   // Wait for pending requests to complete or timeout
@@ -570,8 +610,8 @@ begin
   end;
 end;
 
-function TMCPHttpTransport.AddSSEConnection(Handle: TConnectionAsyncHandle;
-  const SessionId: RawUtf8): Boolean;
+function TMCPHttpTransport.AddSSEConnectionSlot(
+  const Conn: TMCPSSEConnection): Boolean;
 var
   i: Integer;
 begin
@@ -580,7 +620,8 @@ begin
   try
     // Check if already exists
     for i := 0 to High(fSSEConnections) do
-      if fSSEConnections[i].Active and (fSSEConnections[i].Handle = Handle) then
+      if fSSEConnections[i].Active and
+         (fSSEConnections[i].Handle = Conn.Handle) then
         Exit;
 
     // Check limit
@@ -592,36 +633,56 @@ begin
     end;
 
     // Find empty slot or extend array
-    for i := 0 to High(fSSEConnections) do
-      if not fSSEConnections[i].Active then
-      begin
-        fSSEConnections[i].Handle := Handle;
-        fSSEConnections[i].SessionId := SessionId;
-        fSSEConnections[i].ConnectedAt := Now;
-        fSSEConnections[i].LastSentAt := GetTickCount64;
-        fSSEConnections[i].Active := True;
-        Inc(fSSEConnectionCount);
-        Result := True;
-        TSynLog.Add.Log(sllDebug, 'SSE connection added #% (total: %)',
-          [Handle, fSSEConnectionCount]);
-        Exit;
-      end;
-
-    // Extend array
-    i := Length(fSSEConnections);
-    SetLength(fSSEConnections, i + 1);
-    fSSEConnections[i].Handle := Handle;
-    fSSEConnections[i].SessionId := SessionId;
-    fSSEConnections[i].ConnectedAt := Now;
-    fSSEConnections[i].LastSentAt := GetTickCount64;
-    fSSEConnections[i].Active := True;
-    Inc(fSSEConnectionCount);
-    Result := True;
-    TSynLog.Add.Log(sllDebug, 'SSE connection added #% (total: %)',
-      [Handle, fSSEConnectionCount]);
+    for i := 0 to Length(fSSEConnections) do
+    begin
+      if i = Length(fSSEConnections) then
+        SetLength(fSSEConnections, i + 1)
+      else if fSSEConnections[i].Active then
+        Continue;
+      fSSEConnections[i] := Conn;
+      fSSEConnections[i].ConnectedAt := Now;
+      fSSEConnections[i].LastSentAt := GetTickCount64;
+      fSSEConnections[i].Active := True;
+      Inc(fSSEConnectionCount);
+      Result := True;
+      TSynLog.Add.Log(sllDebug, 'SSE connection added #% (total: %)',
+        [Conn.Handle, fSSEConnectionCount]);
+      Exit;
+    end;
   finally
     LeaveCriticalSection(fSSELock);
   end;
+end;
+
+function TMCPHttpTransport.AddSSEConnection(Handle: TConnectionAsyncHandle;
+  const SessionId: RawUtf8): Boolean;
+var
+  Conn: TMCPSSEConnection;
+begin
+  Finalize(Conn);
+  FillCharFast(Conn, SizeOf(Conn), 0);
+  Conn.Handle := Handle;
+  Conn.SessionId := SessionId;
+  Result := AddSSEConnectionSlot(Conn);
+end;
+
+function TMCPHttpTransport.AddSubscriptionConnection(
+  Handle: TConnectionAsyncHandle; const SubscriptionId: Variant;
+  AFilterTools, AFilterPrompts, AFilterResources: Boolean;
+  const AFilterUris: TRawUtf8DynArray): Boolean;
+var
+  Conn: TMCPSSEConnection;
+begin
+  Finalize(Conn);
+  FillCharFast(Conn, SizeOf(Conn), 0);
+  Conn.Handle := Handle;
+  Conn.IsSubscription := True;
+  Conn.SubscriptionId := SubscriptionId;
+  Conn.FilterTools := AFilterTools;
+  Conn.FilterPrompts := AFilterPrompts;
+  Conn.FilterResources := AFilterResources;
+  Conn.FilterUris := AFilterUris;
+  Result := AddSSEConnectionSlot(Conn);
 end;
 
 procedure TMCPHttpTransport.RemoveSSEConnection(Handle: TConnectionAsyncHandle);
@@ -648,40 +709,74 @@ end;
 
 procedure TMCPHttpTransport.SendNotification(const Method: RawUtf8;
   const Params: Variant);
-var
-  NotificationJson: RawUtf8;
-  i: Integer;
-  Handles: array of TConnectionAsyncHandle;
-  HandleCount: Integer;
 begin
-  // Build notification JSON
-  NotificationJson := BuildNotification(Method, Params);
+  // route through the filter-aware dispatcher (legacy streams get every
+  // notification; subscriptions/listen streams only what they opted in to)
+  BroadcastEvent(Method, Params);
+end;
 
-  // Collect active handles under lock
+procedure TMCPHttpTransport.BroadcastEvent(const Method: RawUtf8;
+  const Params: Variant);
+var
+  i, n: Integer;
+  Targets: array of TMCPSSEConnection;
+  LegacyJson, Uri: RawUtf8;
+  Match: Boolean;
+begin
+  // snapshot active connections under lock (records are copied)
   EnterCriticalSection(fSSELock);
   try
-    SetLength(Handles, fSSEConnectionCount);
-    HandleCount := 0;
+    SetLength(Targets, fSSEConnectionCount);
+    n := 0;
     for i := 0 to High(fSSEConnections) do
       if fSSEConnections[i].Active then
       begin
-        Handles[HandleCount] := fSSEConnections[i].Handle;
-        Inc(HandleCount);
+        Targets[n] := fSSEConnections[i];
+        Inc(n);
       end;
   finally
     LeaveCriticalSection(fSSELock);
   end;
 
-  // Send to all connections (outside lock to avoid deadlock)
-  if HandleCount > 0 then
+  if n = 0 then
   begin
-    TSynLog.Add.Log(sllDebug, 'Broadcasting notification % to % SSE clients',
-      [Method, HandleCount]);
-    for i := 0 to HandleCount - 1 do
-      SendSSEToConnection(Handles[i], NotificationJson);
-  end
-  else
     TSynLog.Add.Log(sllTrace, 'No SSE clients for notification %', [Method]);
+    Exit;
+  end;
+
+  Uri := '';
+  if Method = MCP_EVENT_RESOURCES_UPDATED then
+    Uri := _Safe(Params)^.U['uri'];
+
+  LegacyJson := '';
+  TSynLog.Add.Log(sllDebug, 'Broadcasting notification % to % SSE clients',
+    [Method, n]);
+  for i := 0 to n - 1 do
+    if Targets[i].IsSubscription then
+    begin
+      // 2026-07-28: only opted-in notification types, tagged with the
+      // subscription id; request-scoped notifications (progress, message,
+      // cancelled) MUST NOT flow on a subscriptions/listen stream
+      Match := False;
+      if Method = MCP_EVENT_TOOLS_LIST_CHANGED then
+        Match := Targets[i].FilterTools
+      else if Method = MCP_EVENT_PROMPTS_LIST_CHANGED then
+        Match := Targets[i].FilterPrompts
+      else if Method = MCP_EVENT_RESOURCES_LIST_CHANGED then
+        Match := Targets[i].FilterResources
+      else if Method = MCP_EVENT_RESOURCES_UPDATED then
+        Match := (Uri <> '') and
+          (FindRawUtf8(Targets[i].FilterUris, Uri) >= 0);
+      if Match then
+        SendSSEToConnection(Targets[i].Handle, BuildNotification(Method,
+          AddSubscriptionMeta(Params, Targets[i].SubscriptionId)));
+    end
+    else
+    begin
+      if LegacyJson = '' then
+        LegacyJson := BuildNotification(Method, Params);
+      SendSSEToConnection(Targets[i].Handle, LegacyJson);
+    end;
 end;
 
 function TMCPHttpTransport.GetHeader(Ctxt: THttpServerRequestAbstract;
@@ -722,11 +817,96 @@ begin
     Exit;
   end;
 
+  // Track the connection so event-bus notifications reach this stream
+  AddSSEConnection(TConnectionAsyncHandle(Ctxt.ConnectionID),
+    GetHeader(Ctxt, 'Mcp-Session-Id'));
+
   // Return SSE response
   Ctxt.OutContentType := SSE_CONTENT_TYPE;
   Ctxt.OutContent := ': sse accepted'#13#10#13#10;
-  Ctxt.OutCustomHeaders := 'Cache-Control: no-cache'#13#10;
+  Ctxt.OutCustomHeaders := Ctxt.OutCustomHeaders +
+    'Cache-Control: no-cache'#13#10'X-Accel-Buffering: no'#13#10;
   Result := HTTP_OK;
+end;
+
+function TMCPHttpTransport.HandleSubscriptionsListen(
+  Ctxt: THttpServerRequestAbstract; const RequestDoc: Variant): Cardinal;
+var
+  ReqId, Params, Agreed, AckParams, Meta, UrisV: Variant;
+  FilterDoc, UrisDoc: PDocVariantData;
+  WantTools, WantPrompts, WantResources: Boolean;
+  Uris: TRawUtf8DynArray;
+  McpMethod: RawUtf8;
+  i: PtrInt;
+begin
+  ReqId := TDocVariantData(RequestDoc).Value['id'];
+
+  // SEP-2243: Mcp-Method header is required and must match the body method
+  McpMethod := GetHeader(Ctxt, 'Mcp-Method');
+  if McpMethod <> 'subscriptions/listen' then
+  begin
+    Ctxt.OutContent := CreateJsonRpcError(ReqId, JSONRPC_HEADER_MISMATCH,
+      'Missing or mismatching Mcp-Method header for subscriptions/listen');
+    Ctxt.OutContentType := JSON_CONTENT_TYPE;
+    Result := HTTP_BAD_REQUEST;
+    Exit;
+  end;
+
+  // requested filter - this server supports all four notification types,
+  // so the agreed set simply echoes what the client opted in to
+  WantTools := False;
+  WantPrompts := False;
+  WantResources := False;
+  Uris := nil;
+  Params := TDocVariantData(RequestDoc).Value['params'];
+  FilterDoc := nil;
+  if not VarIsEmptyOrNull(Params) then
+    FilterDoc := _Safe(Params)^.O['notifications'];
+  if FilterDoc <> nil then
+  begin
+    WantTools := FilterDoc^.B['toolsListChanged'];
+    WantPrompts := FilterDoc^.B['promptsListChanged'];
+    WantResources := FilterDoc^.B['resourcesListChanged'];
+    UrisDoc := FilterDoc^.A['resourceSubscriptions'];
+    if UrisDoc <> nil then
+      UrisDoc^.ToRawUtf8DynArray(Uris);
+  end;
+
+  AddSubscriptionConnection(TConnectionAsyncHandle(Ctxt.ConnectionID),
+    ReqId, WantTools, WantPrompts, WantResources, Uris);
+
+  // the acknowledged notification MUST be the first message on the stream,
+  // carrying the subscription id in _meta
+  Agreed := _ObjFast([]); // stays an empty OBJECT when nothing was requested
+  if WantTools then
+    TDocVariantData(Agreed).B['toolsListChanged'] := True;
+  if WantPrompts then
+    TDocVariantData(Agreed).B['promptsListChanged'] := True;
+  if WantResources then
+    TDocVariantData(Agreed).B['resourcesListChanged'] := True;
+  if Uris <> nil then
+  begin
+    TDocVariantData(UrisV).InitArray([], JSON_FAST);
+    for i := 0 to High(Uris) do
+      TDocVariantData(UrisV).AddItemText(Uris[i]);
+    TDocVariantData(Agreed).AddValue('resourceSubscriptions', UrisV);
+  end;
+  TDocVariantData(Meta).InitFast;
+  TDocVariantData(Meta).AddValue(MCP_META_SUBSCRIPTION_ID, ReqId);
+  TDocVariantData(AckParams).InitFast;
+  TDocVariantData(AckParams).AddValue('notifications', Agreed);
+  TDocVariantData(AckParams).AddValue('_meta', Meta);
+
+  Ctxt.OutContent := FormatSSEData(BuildNotification(
+    'notifications/subscriptions/acknowledged', AckParams));
+  Ctxt.OutContentType := SSE_CONTENT_TYPE;
+  Ctxt.OutCustomHeaders := Ctxt.OutCustomHeaders +
+    'Cache-Control: no-cache'#13#10'X-Accel-Buffering: no'#13#10;
+  Result := HTTP_OK;
+
+  TSynLog.Add.Log(sllInfo,
+    'subscriptions/listen stream opened #% (tools=% prompts=% resources=% uris=%)',
+    [Ctxt.ConnectionID, WantTools, WantPrompts, WantResources, Length(Uris)]);
 end;
 
 function TMCPHttpTransport.HandlePost(Ctxt: THttpServerRequestAbstract): Cardinal;
@@ -737,6 +917,8 @@ var
   Method: RawUtf8;
   NewSessionId: RawUtf8;
   ProtocolVersion: RawUtf8;
+  HeaderVersion, MetaVersion: RawUtf8;
+  Ctx: TMCPRequestContext;
 begin
   // Reject new requests during graceful shutdown
   if fShuttingDown then
@@ -761,6 +943,44 @@ begin
     Method := '';
   end;
 
+  // ---- modern era (2026-07-28+): stateless, no sessions ----
+  // The request declares its version in _meta (authoritative) and/or the
+  // MCP-Protocol-Version header; any Mcp-Session-Id header is ignored
+  HeaderVersion := GetHeader(Ctxt, 'Mcp-Protocol-Version');
+  MetaVersion := GetMetaProtocolVersion(
+    TDocVariantData(RequestDoc).Value['params']);
+  if IsModernProtocolVersion(MetaVersion) or
+     ((MetaVersion = '') and IsModernProtocolVersion(HeaderVersion)) then
+  begin
+    if IdemPropNameU(Method, 'subscriptions/listen') then
+    begin
+      Result := HandleSubscriptionsListen(Ctxt, RequestDoc);
+      Exit;
+    end;
+    InitRequestContext(Ctx);
+    Ctx.IsHttp := True;
+    Ctx.HeaderProtocolVersion := HeaderVersion;
+    Ctx.HeaderMcpMethod := GetHeader(Ctxt, 'Mcp-Method');
+    Ctx.HeaderMcpName := GetHeader(Ctxt, 'Mcp-Name');
+    ResponseBody := ProcessRequestEx(Ctxt.InContent, Ctx);
+    if ResponseBody = '' then
+    begin
+      // notifications are accepted with 202 and no body
+      Result := HTTP_ACCEPTED_202;
+      Exit;
+    end;
+    Ctxt.OutContent := ResponseBody;
+    Ctxt.OutContentType := JSON_CONTENT_TYPE;
+    if Ctx.HttpStatus <> 0 then
+      Result := Ctx.HttpStatus
+    else
+      Result := HTTP_OK;
+    TSynLog.Add.Log(sllDebug, 'HTTP Response (modern, status %): %',
+      [Result, ResponseBody]);
+    Exit;
+  end;
+
+  // ---- legacy eras (initialize handshake + sessions) ----
   // Validate session for methods that require it
   if RequiresSession(Method) then
   begin
@@ -900,18 +1120,29 @@ begin
   begin
     Ctxt.OutContent := ErrorResponse;
     Ctxt.OutContentType := JSON_CONTENT_TYPE;
-    Result := HTTP_OK; // JSON-RPC errors return 200 with error in body
+    Result := HTTP_BAD_REQUEST; // spec: unsupported version -> 400
     Exit;
   end;
 
-  // Handle DELETE - terminate session (MCP spec)
+  // 2026-07-28 removed the GET stream endpoint and protocol-level sessions:
+  // a modern client sending GET or DELETE gets 405 Method Not Allowed;
+  // legacy clients (no version header, or a pre-2026 version) keep the old
+  // session/SSE behavior of the corresponding revision
+  if ((Ctxt.Method = 'GET') or (Ctxt.Method = 'DELETE')) and
+     IsModernProtocolVersion(GetHeader(Ctxt, 'Mcp-Protocol-Version')) then
+  begin
+    Result := HTTP_METHOD_NOT_ALLOWED;
+    Exit;
+  end;
+
+  // Handle DELETE - terminate session (legacy eras)
   if Ctxt.Method = 'DELETE' then
   begin
     Result := HandleDelete(Ctxt);
     Exit;
   end;
 
-  // Handle GET - SSE stream or server info
+  // Handle GET - SSE stream or server info (legacy eras)
   if Ctxt.Method = 'GET' then
   begin
     Result := HandleGetSSE(Ctxt);
@@ -934,7 +1165,7 @@ begin
   Ctxt.OutCustomHeaders := FormatUtf8(
     'Access-Control-Allow-Origin: %'#13#10 +
     'Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS'#13#10 +
-    'Access-Control-Allow-Headers: Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version'#13#10 +
+    'Access-Control-Allow-Headers: Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name'#13#10 +
     'Access-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version'#13#10 +
     'Access-Control-Max-Age: 86400'#13#10,
     [AllowedOrigin]);
@@ -1290,14 +1521,11 @@ begin
     end
     else
     begin
-      // Unsupported version - reject with server error
+      // Unsupported version - 400 Bad Request with the spec error (-32022)
+      // whose data lists the supported versions for client retry
       Result := False;
       ProtocolVersion := '';
-      ErrorResponse := CreateJsonRpcError(
-        Null,
-        JSONRPC_SERVER_ERROR,
-        FormatUtf8('Unsupported protocol version: %. Supported versions: %',
-          [HeaderVersion, MCP_SUPPORTED_VERSIONS]));
+      ErrorResponse := CreateUnsupportedVersionError(Null, HeaderVersion);
       TSynLog.Add.Log(sllWarning,
         'Unsupported Mcp-Protocol-Version: %', [HeaderVersion]);
     end;
@@ -1410,6 +1638,45 @@ begin
   if SentCount > 0 then
     TSynLog.Add.Log(sllDebug, 'SSE keepalive sent to % of % connections',
       [SentCount, HandleCount]);
+end;
+
+procedure TMCPHttpTransport.SendSubscriptionTeardowns;
+var
+  i, n: Integer;
+  Targets: array of TMCPSSEConnection;
+  Response, ResultV, Meta: Variant;
+begin
+  EnterCriticalSection(fSSELock);
+  try
+    SetLength(Targets, fSSEConnectionCount);
+    n := 0;
+    for i := 0 to High(fSSEConnections) do
+      if fSSEConnections[i].Active and fSSEConnections[i].IsSubscription then
+      begin
+        Targets[n] := fSSEConnections[i];
+        Inc(n);
+      end;
+  finally
+    LeaveCriticalSection(fSSELock);
+  end;
+
+  for i := 0 to n - 1 do
+  begin
+    TDocVariantData(Meta).InitFast;
+    TDocVariantData(Meta).AddValue(MCP_META_SUBSCRIPTION_ID,
+      Targets[i].SubscriptionId);
+    TDocVariantData(ResultV).InitFast;
+    TDocVariantData(ResultV).U['resultType'] := 'complete';
+    TDocVariantData(ResultV).AddValue('_meta', Meta);
+    Response := CreateJsonRpcResponse(Targets[i].SubscriptionId);
+    TDocVariantData(Response).AddValue('result', ResultV);
+    SendSSEToConnection(Targets[i].Handle,
+      TDocVariantData(Response).ToJson);
+  end;
+
+  if n > 0 then
+    TSynLog.Add.Log(sllInfo,
+      'Sent graceful teardown to % subscription streams', [n]);
 end;
 
 { Event Bus Integration }

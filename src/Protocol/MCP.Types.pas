@@ -13,19 +13,29 @@ uses
   mormot.core.os,
   mormot.core.text,
   mormot.core.unicode,
+  mormot.core.buffers,
   mormot.core.variants,
   mormot.core.json,
   mormot.core.rtti;
 
 const
   /// MCP Protocol version supported by this server (latest)
-  MCP_PROTOCOL_VERSION = '2025-06-18';
+  MCP_PROTOCOL_VERSION = '2026-07-28';
+
+  /// First protocol revision using the stateless per-request model (SEP-2575)
+  // - Requests negotiated at this version or later follow the "modern era":
+  //   no initialize handshake, no sessions, per-request _meta version and
+  //   capabilities, required resultType on results
+  MCP_PROTOCOL_VERSION_MODERN = '2026-07-28';
 
   /// MCP Protocol version assumed when client doesn't provide a version header
+  // - Per spec, servers MAY treat requests without MCP-Protocol-Version as
+  //   2025-03-26 to support clients predating the header
   MCP_PROTOCOL_VERSION_DEFAULT = '2025-03-26';
 
   /// Supported MCP Protocol versions (comma-separated for validation)
-  MCP_SUPPORTED_VERSIONS = '2025-06-18,2025-03-26,2024-11-05';
+  // - typed constant so it can be iterated as PUtf8Char
+  MCP_SUPPORTED_VERSIONS: RawUtf8 = '2026-07-28,2025-11-25,2025-06-18,2025-03-26,2024-11-05';
 
   /// JSON-RPC 2.0 Error Codes
   JSONRPC_PARSE_ERROR      = -32700;
@@ -37,7 +47,37 @@ const
   /// MCP-specific Error Codes
   JSONRPC_SERVER_ERROR     = -32000;
   JSONRPC_REQUEST_CANCELLED = -32800;
+  /// resource not found - legacy code (2025-11-25 and earlier)
+  // - 2026-07-28 replaced it by JSONRPC_INVALID_PARAMS (-32602); the old code
+  //   remains reserved by the spec and is still returned to legacy-era clients
   JSONRPC_RESOURCE_NOT_FOUND = -32002;
+
+  /// 2026-07-28 spec-reserved error codes (allocated from -32020 downward)
+  // - HTTP headers do not match the request body, or required headers missing
+  JSONRPC_HEADER_MISMATCH = -32020;
+  // - server requires a client capability not declared in clientCapabilities
+  JSONRPC_MISSING_CLIENT_CAPABILITY = -32021;
+  // - the request's protocol version is not supported by this server
+  JSONRPC_UNSUPPORTED_PROTOCOL_VERSION = -32022;
+
+  /// reserved _meta keys of the 2026-07-28 stateless protocol
+  MCP_META_PROTOCOL_VERSION    = 'io.modelcontextprotocol/protocolVersion';
+  MCP_META_CLIENT_INFO         = 'io.modelcontextprotocol/clientInfo';
+  MCP_META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
+  MCP_META_LOG_LEVEL           = 'io.modelcontextprotocol/logLevel';
+  MCP_META_SERVER_INFO         = 'io.modelcontextprotocol/serverInfo';
+  MCP_META_SUBSCRIPTION_ID     = 'io.modelcontextprotocol/subscriptionId';
+
+  /// default CacheableResult hints (SEP-2549) emitted on modern-era results
+  // - list endpoints: content changes are also signalled via listChanged, so a
+  //   short TTL is a safe freshness hint
+  MCP_CACHE_TTL_LIST_MS = 60000;
+  // - server/discover: capabilities and supported versions are near-static
+  MCP_CACHE_TTL_DISCOVER_MS = 300000;
+  // - resources/read: content may be dynamic - immediately stale by default
+  MCP_CACHE_TTL_READ_MS = 0;
+  MCP_CACHE_SCOPE_PUBLIC: RawUtf8 = 'public';
+  MCP_CACHE_SCOPE_PRIVATE: RawUtf8 = 'private';
 
 type
   /// MCP-specific exception class
@@ -94,6 +134,30 @@ type
     function GetCount: Integer;
   end;
 
+  /// Per-request context exchanged between a transport and the processor
+  // - The transport fills the input fields (HTTP headers, legacy session);
+  //   the request processor resolves the protocol era and suggests an HTTP
+  //   status code for the response (2026-07-28 mandates 400/404 for some
+  //   protocol-level errors)
+  TMCPRequestContext = record
+    /// True when the request arrived over HTTP (header fields are meaningful)
+    IsHttp: Boolean;
+    /// MCP-Protocol-Version header value ('' when absent or non-HTTP)
+    HeaderProtocolVersion: RawUtf8;
+    /// Mcp-Method header value ('' when absent)
+    HeaderMcpMethod: RawUtf8;
+    /// Mcp-Name header value, still sentinel-encoded ('' when absent)
+    HeaderMcpName: RawUtf8;
+    /// legacy session id (initialize-based eras only)
+    SessionId: RawUtf8;
+    /// OUT: effective protocol version resolved for this request
+    ProtocolVersion: RawUtf8;
+    /// OUT: True when the request follows the stateless 2026-07-28+ model
+    Modern: Boolean;
+    /// OUT: suggested HTTP status for the response (0 = transport default)
+    HttpStatus: Integer;
+  end;
+
   /// MCP Server settings
   TMCPServerSettings = record
     /// Server name reported to clients
@@ -146,6 +210,49 @@ function CreateJsonRpcError(const RequestId: Variant;
 /// Check if a protocol version is supported
 function IsSupportedProtocolVersion(const Version: RawUtf8): Boolean;
 
+/// True when Version uses the stateless 2026-07-28+ protocol model
+// - ISO date version strings compare correctly as plain bytes
+function IsModernProtocolVersion(const Version: RawUtf8): Boolean;
+
+/// Supported protocol versions as a TDocVariant array
+// - used by server/discover and UnsupportedProtocolVersionError data
+function SupportedProtocolVersionsArray: Variant;
+
+/// Create a JSON-RPC 2.0 error response with an additional data payload
+function CreateJsonRpcErrorWithData(const RequestId: Variant;
+  ErrorCode: Integer; const ErrorMessage: RawUtf8;
+  const Data: Variant): RawUtf8;
+
+/// Build an UnsupportedProtocolVersionError (-32022) response
+// - data carries {supported, requested} so the client can retry with a
+//   mutually supported version
+function CreateUnsupportedVersionError(const RequestId: Variant;
+  const Requested: RawUtf8): RawUtf8;
+
+/// Decode the '=?base64?...?=' sentinel format of Mcp-Name / Mcp-Param-*
+// HTTP header values (2026-07-28 Streamable HTTP value encoding)
+// - returns the value unchanged when it does not carry the sentinel markers
+function DecodeMcpHeaderValue(const Value: RawUtf8): RawUtf8;
+
+/// Return the _meta object of a request's params, or nil if absent
+function GetRequestMeta(const Params: Variant): PDocVariantData;
+
+/// Return _meta['io.modelcontextprotocol/protocolVersion'] ('' if absent)
+function GetMetaProtocolVersion(const Params: Variant): RawUtf8;
+
+/// Initialize a request context with non-HTTP defaults
+procedure InitRequestContext(out Ctx: TMCPRequestContext);
+
+/// Compare two JSON-RPC request ids (string or integer variants)
+function MCPRequestIdEquals(const V1, V2: Variant): Boolean;
+
+/// Build a copy of notification params carrying the subscription id in _meta
+// - notifications delivered on a subscriptions/listen stream MUST carry
+//   'io.modelcontextprotocol/subscriptionId'; the copy avoids mutating the
+//   shared event-bus payload
+function AddSubscriptionMeta(const Params: Variant;
+  const SubscriptionId: Variant): Variant;
+
 implementation
 
 { TMCPCancelledRequests }
@@ -171,7 +278,7 @@ begin
   inherited;
 end;
 
-function VariantEquals(const V1, V2: Variant): Boolean;
+function MCPRequestIdEquals(const V1, V2: Variant): Boolean;
 begin
   // Compare variants handling both string and integer IDs
   Result := (VarType(V1) = VarType(V2)) and (V1 = V2);
@@ -189,7 +296,7 @@ begin
   try
     // Check if already in list
     for i := 0 to High(fCancelled) do
-      if VariantEquals(fCancelled[i], RequestId) then
+      if MCPRequestIdEquals(fCancelled[i], RequestId) then
         Exit;
 
     // Add to list
@@ -214,7 +321,7 @@ begin
   EnterCriticalSection(fLock);
   try
     for i := 0 to High(fCancelled) do
-      if VariantEquals(fCancelled[i], RequestId) then
+      if MCPRequestIdEquals(fCancelled[i], RequestId) then
       begin
         Result := True;
         Exit;
@@ -234,7 +341,7 @@ begin
   EnterCriticalSection(fLock);
   try
     for i := High(fCancelled) downto 0 do
-      if VariantEquals(fCancelled[i], RequestId) then
+      if MCPRequestIdEquals(fCancelled[i], RequestId) then
       begin
         // Remove by shifting
         if i < High(fCancelled) then
@@ -264,7 +371,7 @@ begin
   EnterCriticalSection(fLock);
   try
     for i := 0 to High(fCancelled) do
-      if VariantEquals(fCancelled[i], RequestId) then
+      if MCPRequestIdEquals(fCancelled[i], RequestId) then
       begin
         Result := fReasons[i];
         Exit;
@@ -341,13 +448,141 @@ begin
 end;
 
 function IsSupportedProtocolVersion(const Version: RawUtf8): Boolean;
+var
+  p: PUtf8Char;
+  v: RawUtf8;
 begin
-  // Check if version matches one of the supported versions
-  // Must include 2024-11-05 for backward compatibility with older clients
-  Result := (Version <> '') and
-    (IdemPropNameU(Version, MCP_PROTOCOL_VERSION) or
-     IdemPropNameU(Version, MCP_PROTOCOL_VERSION_DEFAULT) or
-     IdemPropNameU(Version, '2024-11-05'));
+  Result := False;
+  if Version = '' then
+    Exit;
+  p := pointer(MCP_SUPPORTED_VERSIONS);
+  while p <> nil do
+  begin
+    GetNextItem(p, ',', v);
+    if v = Version then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function IsModernProtocolVersion(const Version: RawUtf8): Boolean;
+begin
+  // ISO 'YYYY-MM-DD' version strings order correctly as plain bytes
+  Result := (Version <> '') and (Version >= MCP_PROTOCOL_VERSION_MODERN);
+end;
+
+function SupportedProtocolVersionsArray: Variant;
+var
+  p: PUtf8Char;
+  v: RawUtf8;
+begin
+  TDocVariantData(Result).InitArray([], JSON_FAST);
+  p := pointer(MCP_SUPPORTED_VERSIONS);
+  while p <> nil do
+  begin
+    GetNextItem(p, ',', v);
+    TDocVariantData(Result).AddItemText(v);
+  end;
+end;
+
+function CreateJsonRpcErrorWithData(const RequestId: Variant;
+  ErrorCode: Integer; const ErrorMessage: RawUtf8;
+  const Data: Variant): RawUtf8;
+var
+  Response, Error: Variant;
+begin
+  TDocVariantData(Response).InitFast;
+  TDocVariantData(Response).S['jsonrpc'] := '2.0';
+  if not VarIsEmptyOrNull(RequestId) then
+    TDocVariantData(Response).AddValue('id', RequestId);
+  TDocVariantData(Error).InitFast;
+  TDocVariantData(Error).I['code'] := ErrorCode;
+  TDocVariantData(Error).U['message'] := ErrorMessage;
+  if not VarIsEmptyOrNull(Data) then
+    TDocVariantData(Error).AddValue('data', Data);
+  TDocVariantData(Response).AddValue('error', Error);
+  Result := TDocVariantData(Response).ToJson;
+end;
+
+function CreateUnsupportedVersionError(const RequestId: Variant;
+  const Requested: RawUtf8): RawUtf8;
+var
+  Data: Variant;
+begin
+  TDocVariantData(Data).InitFast;
+  TDocVariantData(Data).AddValue('supported', SupportedProtocolVersionsArray);
+  TDocVariantData(Data).U['requested'] := Requested;
+  Result := CreateJsonRpcErrorWithData(RequestId,
+    JSONRPC_UNSUPPORTED_PROTOCOL_VERSION,
+    FormatUtf8('Unsupported protocol version: %', [Requested]), Data);
+end;
+
+function DecodeMcpHeaderValue(const Value: RawUtf8): RawUtf8;
+const
+  B64_PREFIX = '=?base64?';
+  B64_SUFFIX = '?=';
+var
+  Decoded: RawByteString;
+begin
+  // markers are case-sensitive lowercase per spec
+  if (Length(Value) > Length(B64_PREFIX) + Length(B64_SUFFIX)) and
+     (Copy(Value, 1, Length(B64_PREFIX)) = B64_PREFIX) and
+     (Copy(Value, Length(Value) - Length(B64_SUFFIX) + 1, Length(B64_SUFFIX)) =
+       B64_SUFFIX) then
+  begin
+    Decoded := Base64ToBinSafe(
+      Copy(Value, Length(B64_PREFIX) + 1,
+        Length(Value) - Length(B64_PREFIX) - Length(B64_SUFFIX)));
+    Result := RawUtf8(Decoded);
+  end
+  else
+    Result := Value;
+end;
+
+function GetRequestMeta(const Params: Variant): PDocVariantData;
+begin
+  Result := nil;
+  if VarIsEmptyOrNull(Params) then
+    Exit;
+  Result := _Safe(Params)^.O['_meta'];
+end;
+
+function GetMetaProtocolVersion(const Params: Variant): RawUtf8;
+var
+  Meta: PDocVariantData;
+begin
+  Result := '';
+  Meta := GetRequestMeta(Params);
+  if Meta <> nil then
+    Result := Meta^.U[MCP_META_PROTOCOL_VERSION];
+end;
+
+function AddSubscriptionMeta(const Params: Variant;
+  const SubscriptionId: Variant): Variant;
+var
+  Meta: Variant;
+begin
+  if VarIsEmptyOrNull(Params) then
+    TDocVariantData(Result).InitFast
+  else
+    Result := _CopyFast(Params);
+  TDocVariantData(Meta).InitFast;
+  TDocVariantData(Meta).AddValue(MCP_META_SUBSCRIPTION_ID, SubscriptionId);
+  _Safe(Result)^.AddOrUpdateValue('_meta', Meta);
+end;
+
+procedure InitRequestContext(out Ctx: TMCPRequestContext);
+begin
+  Ctx.IsHttp := False;
+  Ctx.HeaderProtocolVersion := '';
+  Ctx.HeaderMcpMethod := '';
+  Ctx.HeaderMcpName := '';
+  Ctx.SessionId := '';
+  Ctx.ProtocolVersion := '';
+  Ctx.Modern := False;
+  Ctx.HttpStatus := 0;
 end;
 
 end.

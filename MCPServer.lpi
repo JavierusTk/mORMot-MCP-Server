@@ -94,6 +94,10 @@
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
+        <Filename Value="src/Core/MCP.RequestProcessor.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
         <Filename Value="src/Managers/MCP.Manager.Core.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
