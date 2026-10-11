@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-This folder contains the two foundational infrastructure units that all other MCP server layers depend on. Nothing in `src/core/` depends on Managers, Tools, Resources, Prompts, or Transports — the dependency arrow points strictly inward.
+This folder contains the infrastructure units the other MCP server layers depend on: the method registry, the event bus, and the JSON-RPC request processor shared by the `.dpr` and `.lpr` entry points. Only `MCP.RequestProcessor` reaches outward, and only to `MCP.Manager.Resources` (for `EMCPResourceNotFound`); nothing here depends on Tools, Prompts, or Transports.
 
 ## Units
 
@@ -34,9 +34,14 @@ This folder contains the two foundational infrastructure units that all other MC
 - `MCP_EVENT_MESSAGE`
 - `MCP_EVENT_PROGRESS`
 - `MCP_EVENT_CANCELLED`
+- `MCP_EVENT_SEND_NOTIFICATION` (`'__internal/send_notification'`) — host passthrough: the stdio transport subscribes and forwards `{method, params}` verbatim, so a host application can emit any server-initiated notification without the framework knowing the method.
 
 **Consumers**: All managers in `src/Managers/` publish events. `TMCPHttpTransport` subscribes to broadcast them as SSE. `EmitProgress()` is a convenience wrapper for tool implementations to report progress via `MCP_EVENT_PROGRESS`.
 
+### MCP.RequestProcessor.pas — JSON-RPC Dispatch and Protocol Eras
+
+`TMCPRequestProcessor` is the JSON-RPC dispatch shared by `MCPServer.dpr` and `MCPServer.lpr` (`HandleRequest` / `HandleRequestEx`). It resolves each request's protocol era (legacy 2024-11-05..2025-11-25: initialize handshake + sessions; modern 2026-07-28+: stateless, per-request `_meta` protocol version), validates modern Streamable-HTTP headers (`ValidateModernHttpRequest`), dispatches through the manager registry, and decorates modern results (`DecorateModernResult`: `resultType`, `serverInfo`, cache hints). `IsMethodRemovedInModern` names the methods the modern era drops.
+
 ## Dependencies
 
-Both units depend only on mORMot2 core units and `MCP.Types` (from `src/Protocol/`). They have no cross-dependency on each other.
+`MCP.Manager.Registry` and `MCP.Events` depend only on mORMot2 core units and `MCP.Types` (from `src/Protocol/`), with no cross-dependency on each other. `MCP.RequestProcessor` additionally uses `MCP.Manager.Resources` (for `EMCPResourceNotFound`).
